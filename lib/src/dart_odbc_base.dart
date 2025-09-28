@@ -61,19 +61,34 @@ class DartOdbc {
   SQLHDBC _hConn = nullptr;
 
   void _initialize({int? version}) {
-    final sqlNullHandle = calloc.allocate<Int>(sizeOf<Int>());
-    final pHEnv = calloc.allocate<SQLHANDLE>(sizeOf<SQLHANDLE>());
+    final pHEnv = calloc<SQLHANDLE>();
+
+    // Allocate the environment handle using ODBC 3.x API
+    final ret = _sql.SQLAllocHandle(
+      SQL_HANDLE_ENV,    // Handle type
+      nullptr,           // No input handle for environment
+      pHEnv,             // Output handle
+    );
+print('alloc handle done');
     tryOdbc(
-      _sql.SQLAllocEnv(pHEnv),
+      ret,
       operationType: SQL_HANDLE_ENV,
       handle: pHEnv.value,
       onException: HandleException(),
     );
-    _hEnv = pHEnv.value;
 
-    calloc
-      ..free(pHEnv)
-      ..free(sqlNullHandle);
+    _hEnv = pHEnv.value;
+print('try odbc done');
+
+final ret1 = _sql.SQLSetEnvAttr(
+  _hEnv,
+  SQL_ATTR_ODBC_VERSION,
+  Pointer.fromAddress(SQL_OV_ODBC3), // cast int to SQLPOINTER
+  0,
+);
+
+    calloc.free(pHEnv);
+print('init done');
   }
 
   LibOdbc get _sql {
@@ -106,15 +121,16 @@ class DartOdbc {
     final cDsn = _dsn!.toNativeUtf16().cast<UnsignedShort>();
     final cUsername = username.toNativeUtf16().cast<UnsignedShort>();
     final cPassword = password.toNativeUtf16().cast<UnsignedShort>();
+    print('trying with SQL_NTS');
     tryOdbc(
       _sql.SQLConnectW(
         _hConn,
         cDsn,
-        _dsn!.length,
+        SQL_NTS,
         cUsername,
-        username.length,
+        SQL_NTS,
         cPassword,
-        password.length,
+        SQL_NTS,
       ),
       handle: _hConn,
       operationType: SQL_HANDLE_DBC,
