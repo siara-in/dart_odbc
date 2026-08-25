@@ -2,37 +2,26 @@
 
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:dart_odbc/dart_odbc.dart';
 import 'package:dart_odbc/src/libodbcext.dart';
 import 'package:ffi/ffi.dart';
 
-/// DartOdbc class
-/// This is the base class that will be used to interact with the ODBC driver.
+/// Safer, more defensive DartOdbc wrapper.
+/// Key fixes:
+///  - use calloc<T>() consistently
+///  - keep handles valid until disconnected
+///  - use nullptr (not null) for Pointer checks
+///  - use SQL_NTS for string lengths to avoid inconsistent length math
+///  - correct diagnostics allocations (SQLGetDiagRecW)
 class DartOdbc {
-  /// DartOdbc constructor
-  /// This constructor will initialize the ODBC environment and connection.
-  /// The [pathToDriver] parameter is the path to the ODBC driver (optional).
-  /// if [pathToDriver] is not provided, the driver will be auto-detected from the ODBC.ini file.
-  /// The [dsn] parameter is the name of the DSN to connect to.
-  /// If [dsn] is not provided, only [connectWithConnectionString] can be used.
-  /// Optionally the ODBC version can be specified using the [version] parameter
-  /// Definitions for these values can be found in the [LibOdbc] class.
-  /// Please note that some drivers may not work with some drivers.
   factory DartOdbc({
     String? dsn,
     String? pathToDriver,
     @Deprecated('Is not used anymore') int? version,
-    @Deprecated(
-      'It is not required to use this anymore as the issue has been fixed',
-    )
-    UtfType utfType = UtfType.utf16,
-  }) {
-    return DartOdbc._internal(
-      dsn: dsn,
-      pathToDriver: pathToDriver,
-      version: version,
-    );
-  }
+    @Deprecated('Not used') UtfType utfType = UtfType.utf16,
+  }) =>
+      DartOdbc._internal(dsn: dsn, pathToDriver: pathToDriver, version: version);
 
   DartOdbc._internal({String? dsn, String? pathToDriver, int? version})
       : _dsn = dsn {
@@ -46,7 +35,6 @@ class DartOdbc {
       } else if (Platform.isMacOS) {
         __sql = LibOdbcExt(DynamicLibrary.open('libodbc.dylib'));
       }
-
       if (__sql == null) {
         throw ODBCException('ODBC driver not found');
       }
@@ -57,332 +45,377 @@ class DartOdbc {
 
   LibOdbc? __sql;
   final String? _dsn;
+
+  /// keep non-nullable pointers but initialized to nullptr
   SQLHANDLE _hEnv = nullptr;
   SQLHDBC _hConn = nullptr;
 
-  void _initialize({int? version}) {
-    final pHEnv = calloc<SQLHANDLE>();
-
-    // Allocate the environment handle using ODBC 3.x API
-    final ret = _sql.SQLAllocHandle(
-      SQL_HANDLE_ENV,    // Handle type
-      nullptr,           // No input handle for environment
-      pHEnv,             // Output handle
-    );
-print('alloc handle done');
-    tryOdbc(
-      ret,
-      operationType: SQL_HANDLE_ENV,
-      handle: pHEnv.value,
-      onException: HandleException(),
-    );
-
-    _hEnv = pHEnv.value;
-print('try odbc done');
-
-final ret1 = _sql.SQLSetEnvAttr(
-  _hEnv,
-  SQL_ATTR_ODBC_VERSION,
-  Pointer.fromAddress(SQL_OV_ODBC3), // cast int to SQLPOINTER
-  0,
-);
-
-    calloc.free(pHEnv);
-print('init done');
-  }
-
   LibOdbc get _sql {
-    if (__sql != null) {
-      return __sql!;
-    }
-
+    if (__sql != null) return __sql!;
     throw ODBCException('ODBC driver not found');
   }
 
-  /// Connect to a database
-  /// This is the name you gave when setting up the ODBC manager.
-  /// The [username] parameter is the username to connect to the database.
-  /// The [password] parameter is the password to connect to the database.
+  void _initialize({int? version}) {
+    // allocate environment handle (pointer to SQLHANDLE)
+    final pHEnv = calloc<SQLHANDLE>();
+    try {
+      final rc = _sql.SQLAllocHandle(SQL_HANDLE_ENV, nullptr, pHEnv);
+      tryOdbc(rc, operationType: SQL_HANDLE_ENV, handle: pHEnv.value, onException: HandleException());
+      _hEnv = pHEnv.value;
+
+      // set ODBC version to 3
+      // SQLSetEnvAttr expects SQLPOINTER for attribute value
+      final ret1 = _sql.SQLSetEnvAttr(
+        _hEnv, SQL_ATTR_ODBC_VERSION,
+        Pointer.fromAddress(SQL_OV_ODBC3), // cast int to SQLPOINTER
+        0,
+      );
+      tryOdbc(ret1, handle: _hEnv, operationType: SQL_HANDLE_ENV, onException: HandleException());
+    } finally {
+      // free the temporary pointer wrapper (not the handle itself)
+      calloc.free(pHEnv);
+    }
+  }
+
+  /// Connect using DSN
   Future<void> connect({
     required String username,
     required String password,
   }) async {
-    if (_dsn == null) {
-      throw ODBCException('DSN not provided');
+    if (_dsn == null) throw ODBCException('DSN not provided');
+
+    final pHConn = calloc<SQLHDBC>();
+    try {
+      tryOdbc(
+        _sql.SQLAllocHandle(SQL_HANDLE_DBC, _hEnv, pHConn),
+        handle: _hEnv,
+        operationType: SQL_HANDLE_DBC,
+        onException: HandleException(),
+      );
+      _hConn = pHConn.value;
+
+      // set login timeout (defensive)
+      final t = calloc<SQLUINTEGER>()..value = 30;
+      try {
+        tryOdbc(
+          _sql.SQLSetConnectAttr(
+            _hConn,
+            SQL_LOGIN_TIMEOUT,
+            t.cast(),
+            0,
+          ),
+          handle: _hConn,
+          operationType: SQL_HANDLE_DBC,
+          onException: ConnectionException(),
+        );
+      } finally {
+        calloc.free(t);
+      }
+
+      final cDsn = _dsn!.toNativeUtf16().cast<UnsignedShort>();
+      final cUsername = username.toNativeUtf16().cast<UnsignedShort>();
+      final cPassword = password.toNativeUtf16().cast<UnsignedShort>();
+
+      try {
+        tryOdbc(
+          _sql.SQLConnectW(
+            _hConn,
+            cDsn,
+            SQL_NTS,
+            cUsername,
+            SQL_NTS,
+            cPassword,
+            SQL_NTS,
+          ),
+          handle: _hConn,
+          operationType: SQL_HANDLE_DBC,
+          onException: ConnectionException(),
+        );
+      } finally {
+        calloc.free(cDsn);
+        calloc.free(cUsername);
+        calloc.free(cPassword);
+      }
+    } catch (e) {
+      // if allocation succeeded but connect failed, free the DB handle
+      if (_hConn != nullptr) {
+        _sql.SQLFreeHandle(SQL_HANDLE_DBC, _hConn);
+        _hConn = nullptr;
+      }
+      rethrow;
+    } finally {
+      calloc.free(pHConn); // free the temporary pointer wrapper (handle preserved in _hConn)
     }
-    final pHConn = calloc.allocate<SQLHDBC>(sizeOf<SQLHDBC>());
-    tryOdbc(
-      _sql.SQLAllocHandle(SQL_HANDLE_DBC, _hEnv, pHConn),
-      handle: _hEnv,
-      operationType: SQL_HANDLE_DBC,
-      onException: HandleException(),
-    );
-    _hConn = pHConn.value;
-    final cDsn = _dsn!.toNativeUtf16().cast<UnsignedShort>();
-    final cUsername = username.toNativeUtf16().cast<UnsignedShort>();
-    final cPassword = password.toNativeUtf16().cast<UnsignedShort>();
-    print('trying with SQL_NTS');
-    tryOdbc(
-      _sql.SQLConnectW(
-        _hConn,
-        cDsn,
-        SQL_NTS,
-        cUsername,
-        SQL_NTS,
-        cPassword,
-        SQL_NTS,
-      ),
-      handle: _hConn,
-      operationType: SQL_HANDLE_DBC,
-      onException: ConnectionException(),
-    );
-    calloc
-      ..free(pHConn)
-      ..free(cDsn)
-      ..free(cUsername)
-      ..free(cPassword);
   }
 
-  /// Connects to the database using a connection string instead of a DSN.
-  ///
-  /// [connectionString] is the full connection string that provides all necessary
-  /// connection details like driver, server, database, etc.
-  ///
-  /// This method is useful for connecting to data sources like Excel files or text files
-  /// without having to define a DSN.
-  ///
-  /// Throws a [ConnectionException] if the connection fails.
+  /// Connect using connection string (Driver={...};Server=...;UID=...;PWD=...;)
   Future<void> connectWithConnectionString(String connectionString) async {
-    final pHConn = calloc.allocate<SQLHDBC>(sizeOf<SQLHDBC>());
-    tryOdbc(
-      _sql.SQLAllocHandle(SQL_HANDLE_DBC, _hEnv, pHConn),
-      handle: _hEnv,
-      operationType: SQL_HANDLE_DBC,
-      onException: HandleException(),
-    );
-    _hConn = pHConn.value;
+    final pHConn = calloc<SQLHDBC>();
+    try {
+      tryOdbc(
+        _sql.SQLAllocHandle(SQL_HANDLE_DBC, _hEnv, pHConn),
+        handle: _hEnv,
+        operationType: SQL_HANDLE_DBC,
+        onException: HandleException(),
+      );
+      _hConn = pHConn.value;
 
-    final cConnectionString =
-        connectionString.toNativeUtf16().cast<UnsignedShort>();
+      // set login timeout as a defensive measure
+      final t = calloc<SQLUINTEGER>()..value = 30;
+      try {
+        tryOdbc(
+          _sql.SQLSetConnectAttr(
+            _hConn,
+            SQL_LOGIN_TIMEOUT,
+            t.cast(),
+            0,
+          ),
+          handle: _hConn,
+          operationType: SQL_HANDLE_DBC,
+          onException: ConnectionException(),
+        );
+      } finally {
+        calloc.free(t);
+      }
 
-    final outConnectionString = calloc.allocate<UnsignedShort>(256);
-    final outConnectionStringLen = calloc.allocate<Short>(sizeOf<Short>());
+      final cConnectionString = connectionString.toNativeUtf16().cast<UnsignedShort>();
+      const outLen = 2048;
+      final outConnectionString = calloc<UnsignedShort>(outLen);
+      final outConnectionStringLen = calloc<SQLSMALLINT>();
 
-    tryOdbc(
-      _sql.SQLDriverConnectW(
-        _hConn,
-        nullptr,
-        cConnectionString,
-        SQL_NTS,
-        outConnectionString,
-        256,
-        outConnectionStringLen,
-        SQL_DRIVER_NOPROMPT,
-      ),
-      handle: _hConn,
-      operationType: SQL_HANDLE_DBC,
-      onException: ConnectionException(),
-    );
-    calloc
-      ..free(pHConn)
-      ..free(cConnectionString)
-      ..free(outConnectionString)
-      ..free(outConnectionStringLen);
+      try {
+        tryOdbc(
+          _sql.SQLDriverConnectW(
+            _hConn,
+            nullptr,
+            cConnectionString,
+            SQL_NTS,
+            outConnectionString,
+            outLen,
+            outConnectionStringLen,
+            SQL_DRIVER_NOPROMPT,
+          ),
+          handle: _hConn,
+          operationType: SQL_HANDLE_DBC,
+          onException: ConnectionException(),
+        );
+
+        final actualLen = outConnectionStringLen.value;
+        // if driver returned a length, decode that, otherwise decode up to first NUL
+        final resultString = outConnectionString.cast<Utf16>().toDartString(length: actualLen > 0 ? actualLen : null);
+        print('Connected! Driver returned connection string: $resultString');
+      } finally {
+        calloc.free(cConnectionString);
+        calloc.free(outConnectionString);
+        calloc.free(outConnectionStringLen);
+      }
+    } catch (e) {
+      if (_hConn != nullptr) {
+        _sql.SQLFreeHandle(SQL_HANDLE_DBC, _hConn);
+        _hConn = nullptr;
+      }
+      rethrow;
+    } finally {
+      calloc.free(pHConn);
+    }
   }
 
-  /// Retrieves a list of tables from the connected database.
-  ///
-  /// Optionally, you can filter the results by specifying [tableName], [catalog],
-  /// [schema], or [tableType]. If these are omitted, all tables will be returned.
-  ///
-  /// Returns a list of maps, where each map represents a table with its name,
-  /// catalog, schema, and type.
-  ///
-  /// Throws a [FetchException] if fetching tables fails.
   Future<List<Map<String, dynamic>>> getTables({
     String? tableName,
     String? catalog,
     String? schema,
     String? tableType,
   }) async {
-    final pHStmt = calloc.allocate<SQLHSTMT>(sizeOf<SQLHSTMT>());
-    tryOdbc(
-      _sql.SQLAllocHandle(SQL_HANDLE_STMT, _hConn, pHStmt),
-      handle: _hConn,
-      onException: HandleException(),
-    );
-    final hStmt = pHStmt.value;
+    final pHStmt = calloc<SQLHSTMT>();
+    try {
+      tryOdbc(
+        _sql.SQLAllocHandle(SQL_HANDLE_STMT, _hConn, pHStmt),
+        handle: _hConn,
+        onException: HandleException(),
+      );
+      final hStmt = pHStmt.value;
 
-    final cCatalog = catalog?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
-    final cSchema = schema?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
-    final cTableName =
-        tableName?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
-    final cTableType =
-        tableType?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
+      final cCatalog = catalog?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
+      final cSchema = schema?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
+      final cTableName = tableName?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
+      final cTableType = tableType?.toNativeUtf16().cast<UnsignedShort>() ?? nullptr;
 
-    tryOdbc(
-      _sql.SQLTablesW(
-        hStmt,
-        cCatalog,
-        SQL_NTS,
-        cSchema,
-        SQL_NTS,
-        cTableName,
-        SQL_NTS,
-        cTableType,
-        SQL_NTS,
-      ),
-      handle: hStmt,
-      onException: FetchException(),
-    );
+      try {
+        tryOdbc(
+          _sql.SQLTablesW(
+            hStmt,
+            cCatalog,
+            SQL_NTS,
+            cSchema,
+            SQL_NTS,
+            cTableName,
+            SQL_NTS,
+            cTableType,
+            SQL_NTS,
+          ),
+          handle: hStmt,
+          onException: FetchException(),
+        );
 
-    final result = _getResult(hStmt, {});
+        List<String> tblColTypes = [];
+        final result = _getResult(hStmt, {}, tblColTypes);
+        return result;
+      } finally {
+        // free param strings if they were allocated
+        if (cCatalog != nullptr) calloc.free(cCatalog);
+        if (cSchema != nullptr) calloc.free(cSchema);
+        if (cTableName != nullptr) calloc.free(cTableName);
+        if (cTableType != nullptr) calloc.free(cTableType);
 
-    // Clean up
-    _sql.SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-    calloc
-      ..free(pHStmt)
-      ..free(cCatalog)
-      ..free(cSchema)
-      ..free(cTableName)
-      ..free(cTableType);
-
-    return result;
+        _sql.SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+      }
+    } finally {
+      calloc.free(pHStmt);
+    }
   }
 
-  /// Execute a query
-  /// The [query] parameter is the SQL query to execute.
-  /// This function will return a list of maps where each map represents a row
-  /// in the result set. The keys in the map are the column names and the values
-  /// are the column values.
-  /// The [params] parameter is a list of parameters to bind to the query.
-  /// Example query:
-  /// ```dart
-  /// final List<Map<String, dynamic>> result = odbc.execute(
-  ///   'SELECT * FROM USERS WHERE UID = ?',
-  ///   params: [1],
-  /// );
-  /// ```
   Future<List<Map<String, dynamic>>> execute(
     String query, {
     List<dynamic>? params,
+    List<String>? outColTypes,
     Map<String, ColumnType> columnConfig = const {},
   }) async {
-    final pHStmt = calloc.allocate<SQLHSTMT>(sizeOf<SQLHSTMT>());
-    tryOdbc(
-      _sql.SQLAllocHandle(SQL_HANDLE_STMT, _hConn, pHStmt),
-      handle: _hConn,
-      onException: HandleException(),
-    );
-    final hStmt = pHStmt.value;
-    final pointers = <OdbcPointer<dynamic>>[];
-    final cQuery = query.toNativeUtf16();
-
-    // binding sanitized params
-    if (params != null) {
+    final pHStmt = calloc<SQLHSTMT>();
+    try {
       tryOdbc(
-        _sql.SQLPrepareW(hStmt, cQuery.cast(), cQuery.length),
-        handle: hStmt,
-        onException: QueryException(),
+        _sql.SQLAllocHandle(SQL_HANDLE_STMT, _hConn, pHStmt),
+        handle: _hConn,
+        onException: HandleException(),
       );
+      final hStmt = pHStmt.value;
+      final pointers = <OdbcPointer<dynamic>>[];
+      final cQuery = query.toNativeUtf16().cast<UnsignedShort>();
 
-      for (var i = 0; i < params.length; i++) {
-        final param = params[i];
-        final cParam = OdbcConversions.toPointer(param);
-        tryOdbc(
-          _sql.SQLBindParameter(
-            hStmt,
-            i + 1,
-            SQL_PARAM_INPUT,
-            OdbcConversions.getCtypeFromType(param.runtimeType),
-            OdbcConversions.getSqlTypeFromType(param.runtimeType),
-            0,
-            0,
-            cParam.ptr,
-            cParam.length,
-            nullptr,
-          ),
-          handle: hStmt,
-        );
+      try {
+        if (params != null && params.isNotEmpty) {
+          // prepare (use SQL_NTS for null-terminated)
+          tryOdbc(
+            _sql.SQLPrepareW(hStmt, cQuery.cast(), SQL_NTS),
+            handle: hStmt,
+            onException: QueryException(),
+          );
+
+          for (var i = 0; i < params.length; i++) {
+            final param = params[i];
+            final cParam = OdbcConversions.toPointer(param);
+            pointers.add(cParam);
+
+            tryOdbc(
+              _sql.SQLBindParameter(
+                hStmt,
+                i + 1,
+                SQL_PARAM_INPUT,
+                OdbcConversions.getCtypeFromType(param.runtimeType),
+                OdbcConversions.getSqlTypeFromType(param.runtimeType),
+                0,
+                0,
+                cParam.ptr,
+                cParam.length,
+                nullptr,
+              ),
+              handle: hStmt,
+            );
+          }
+
+          tryOdbc(_sql.SQLExecute(hStmt), handle: hStmt);
+        } else {
+          // no params — execute SQL directly, length SQL_NTS
+          tryOdbc(
+            _sql.SQLExecDirectW(hStmt, cQuery.cast(), SQL_NTS),
+            handle: hStmt,
+          );
+        }
+
+        final result = _getResult(hStmt, columnConfig, outColTypes);
+        return result;
+      } finally {
+        // free param pointers and query pointer
+        for (final ptr in pointers) {
+          ptr.free();
+        }
+        calloc.free(cQuery);
+        _sql.SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
       }
+    } finally {
+      calloc.free(pHStmt);
     }
-
-    if (params == null) {
-      tryOdbc(
-        _sql.SQLExecDirectW(hStmt, cQuery.cast(), query.length),
-        handle: hStmt,
-      );
-    } else {
-      tryOdbc(_sql.SQLExecute(hStmt), handle: hStmt);
-    }
-
-    final result = _getResult(hStmt, columnConfig);
-
-    // free memory
-    for (final ptr in pointers) {
-      ptr.free();
-    }
-    calloc.free(cQuery);
-
-    return result;
   }
 
-  /// Function to disconnect from the database
   Future<void> disconnect() async {
-    _sql
-      ..SQLDisconnect(_hConn)
-      ..SQLFreeHandle(SQL_HANDLE_DBC, _hConn)
-      ..SQLFreeHandle(SQL_HANDLE_ENV, _hEnv);
-    _hConn = nullptr;
-    _hEnv = nullptr;
+    // only call disconnect if we have a valid handle
+    if (_hConn != nullptr) {
+      _sql.SQLDisconnect(_hConn);
+      _sql.SQLFreeHandle(SQL_HANDLE_DBC, _hConn);
+      _hConn = nullptr;
+    }
+    if (_hEnv != nullptr) {
+      _sql.SQLFreeHandle(SQL_HANDLE_ENV, _hEnv);
+      _hEnv = nullptr;
+    }
   }
 
-  /// Function to handle ODBC errors
-  /// The [status] parameter is the status code returned by the ODBC function.
-  /// The [onException] parameter is the exception to throw if the status code
-  /// is an error.
-  /// The [handle] parameter is the handle to the ODBC object that caused the
-  /// error.
-  /// The [operationType] parameter is the type of operation that caused the
-  /// error.
-  /// If [handle] is not provided, the error message will not be descriptive.
   void tryOdbc(
     int status, {
     SQLHANDLE? handle,
     int operationType = SQL_HANDLE_STMT,
     ODBCException? onException,
   }) {
-    if (status < 0) {
+    if (status == SQL_ERROR || status == SQL_INVALID_HANDLE) {
       onException ??= ODBCException('ODBC error');
       onException.code = status;
-      if (handle != null) {
-        final nativeErr = calloc.allocate<Int>(sizeOf<Int>())..value = status;
-        final message = '1' * 10000;
-        final msg = message.toNativeUtf16();
-        final pStatus = calloc.allocate<UnsignedShort>(sizeOf<UnsignedShort>())
-          ..value = status;
+
+      if (handle != null && handle != nullptr) {
+        // diagnostics buffers
+        const bufferLength = 1024;
+        final sqlState = calloc<Uint16>(6).cast<Utf16>();
+        final nativeErr = calloc<Int>(); // SQLINTEGER usually 32-bit
+        final msg = calloc<Uint16>(bufferLength).cast<Utf16>();
+        final textLenPtr = calloc<SQLSMALLINT>();
+
         try {
-          _sql.SQLGetDiagRecW(
-            operationType,
-            handle,
-            1,
-            pStatus,
-            nativeErr,
-            msg.cast(),
-            message.length,
-            nullptr,
-          );
-        } catch (e) {
-          // ignore
+          var recNumber = 1;
+          final messages = <String>[];
+
+          while (true) {
+            final diagStatus = _sql.SQLGetDiagRecW(
+              operationType,
+              handle,
+              recNumber,
+              sqlState.cast(),
+              nativeErr,
+              msg.cast(),
+              bufferLength,
+              textLenPtr,
+            );
+
+            if (diagStatus == SQL_NO_DATA) break;
+            if (diagStatus == SQL_SUCCESS || diagStatus == SQL_SUCCESS_WITH_INFO) {
+              // textLenPtr contains number of WCHAR chars (usually)
+              final dartMessage = msg.toDartString(length: textLenPtr.value);
+              final dartState = sqlState.toDartString();
+              messages.add('[$dartState] ${dartMessage.trim()} (err=${nativeErr.value})');
+            } else {
+              break;
+            }
+            recNumber++;
+          }
+
+          if (messages.isNotEmpty) {
+            onException.message = messages.join(' | ');
+          } else {
+            onException.message = 'ODBC error (no diagnostics)';
+          }
+        } finally {
+          calloc.free(sqlState);
+          calloc.free(nativeErr);
+          calloc.free(msg);
+          calloc.free(textLenPtr);
         }
-
-        onException.message = msg.toDartString();
-
-        // free memory
-        calloc
-          ..free(nativeErr)
-          ..free(msg)
-          ..free(pStatus);
       }
 
       throw onException;
@@ -392,120 +425,201 @@ print('init done');
   List<Map<String, dynamic>> _getResult(
     SQLHSTMT hStmt,
     Map<String, ColumnType> columnConfig,
+    List<String>? columnTypes,
   ) {
-    final columnCount = calloc.allocate<SQLSMALLINT>(sizeOf<SQLSMALLINT>());
-    tryOdbc(
-      _sql.SQLNumResultCols(hStmt, columnCount),
-      handle: hStmt,
-      onException: FetchException(),
-    );
+    final columnCountPtr = calloc<SQLSMALLINT>();
+    try {
+      tryOdbc(_sql.SQLNumResultCols(hStmt, columnCountPtr), handle: hStmt, onException: FetchException());
+      final int columnCount = columnCountPtr.value;
+      final columnNames = <String>[];
 
-    final columnNames = <String>[];
-    for (var i = 1; i <= columnCount.value; i++) {
-      final columnNameLength =
-          calloc.allocate<SQLSMALLINT>(sizeOf<SQLSMALLINT>());
-      final columnName = calloc.allocate<Uint16>(sizeOf<Uint16>() * 256);
-      tryOdbc(
-        _sql.SQLDescribeColW(
-          hStmt,
-          i,
-          columnName.cast(),
-          256,
-          columnNameLength,
-          nullptr,
-          nullptr,
-          nullptr,
-          nullptr,
-        ),
-        handle: hStmt,
-        onException: FetchException(),
-      );
-      final charCodes = columnName.asTypedList(columnNameLength.value).toList()
-        ..removeWhere((e) => e == 0);
-      columnNames.add(
-        String.fromCharCodes(charCodes),
-      );
+      if (columnTypes == null) columnTypes = [];
+      columnTypes.clear();
 
-      // free memory
-      calloc
-        ..free(columnName)
-        ..free(columnNameLength);
-    }
+      for (var i = 1; i <= columnCount; i++) {
+        final nameLenPtr = calloc<SQLSMALLINT>();
+        final nameBufChars = 512;
+        final nameBuf = calloc<Uint16>(nameBufChars);
+        final dataTypePtr = calloc<SQLSMALLINT>();
 
-    final rows = <Map<String, dynamic>>[];
+        try {
+          tryOdbc(
+            _sql.SQLDescribeColW(
+              hStmt,
+              i,
+              nameBuf.cast(),
+              nameBufChars,
+              nameLenPtr,
+              dataTypePtr,
+              nullptr,
+              nullptr,
+              nullptr,
+            ),
+            handle: hStmt,
+            onException: FetchException(),
+          );
 
-    while (_sql.SQLFetch(hStmt) == SQL_SUCCESS) {
-      final row = <String, dynamic>{};
-      for (var i = 1; i <= columnCount.value; i++) {
-        final columnType = columnConfig[columnNames[i - 1]];
-        final columnValueLength = calloc.allocate<SQLLEN>(sizeOf<SQLLEN>());
-        final columnValue = calloc.allocate<Uint16>(
-          sizeOf<Uint16>() * (columnType?.size ?? 256),
-        );
-        tryOdbc(
-          _sql.SQLGetData(
-            hStmt,
-            i,
-            /* columnType?.type ?? */ SQL_WCHAR,
-            columnValue.cast(),
-            columnType?.size ?? 256,
-            columnValueLength,
-          ),
-          handle: hStmt,
-          onException: FetchException(),
-        );
-        if (columnValueLength.value == SQL_NULL_DATA) {
-          row[columnNames[i - 1]] = null;
-          continue;
+          final nameCharCount = nameLenPtr.value;
+          final actual = nameBuf.asTypedList(nameCharCount > 0 ? nameCharCount : nameBufChars).where((c) => c != 0).toList();
+          columnNames.add(String.fromCharCodes(actual));
+
+          // Map SQL type -> C type string
+          final sqlType = dataTypePtr.value;
+          String cTypeStr;
+          switch (sqlType) {
+            case SQL_CHAR:
+            case SQL_VARCHAR:
+            case SQL_LONGVARCHAR:
+              cTypeStr = "SQL_C_CHAR";
+              break;
+            case SQL_WCHAR:
+            case SQL_WVARCHAR:
+            case SQL_WLONGVARCHAR:
+              cTypeStr = "SQL_C_WCHAR";
+              break;
+            case SQL_BINARY:
+            case SQL_VARBINARY:
+            case SQL_LONGVARBINARY:
+              cTypeStr = "SQL_C_BINARY";
+              break;
+            case SQL_INTEGER:
+              cTypeStr = "SQL_C_LONG";
+              break;
+            case SQL_BIGINT:
+              cTypeStr = "SQL_C_SBIGINT";
+              break;
+            case SQL_FLOAT:
+              cTypeStr = "SQL_C_FLOAT";
+              break;
+            case SQL_DOUBLE:
+            case SQL_REAL:
+              cTypeStr = "SQL_C_DOUBLE";
+              break;
+            case SQL_TYPE_DATE:
+              cTypeStr = "SQL_C_DATE";
+              break;
+            case SQL_TYPE_TIME:
+              cTypeStr = "SQL_C_TIME";
+              break;
+            case SQL_TYPE_TIMESTAMP:
+              cTypeStr = "SQL_C_TIMESTAMP";
+              break;
+            default:
+              cTypeStr = "SQL_C_WCHAR";
+              break;
+          }
+          columnTypes.add(cTypeStr);
+        } finally {
+          calloc.free(nameBuf);
+          calloc.free(nameLenPtr);
+          calloc.free(dataTypePtr);
         }
-        // removing trailing zeros before converting to string
-        late final List<int> charCodes;
-        if (columnType != null && columnType.isBinary()) {
-          charCodes = columnValue.asTypedList(columnType.size ?? 100).toList();
-          row[columnNames[i - 1]] =
-              OdbcConversions.hexToUint8List(String.fromCharCodes(charCodes));
-        } else {
-          charCodes = columnValue.asTypedList(columnValueLength.value).toList()
-            ..removeWhere((e) => e == 0);
-          row[columnNames[i - 1]] = String.fromCharCodes(charCodes);
-        }
-
-        // free memory
-        calloc
-          ..free(columnValue)
-          ..free(columnValueLength);
       }
 
-      rows.add(row);
+      final rows = <Map<String, dynamic>>[];
+
+      while (true) {
+        final fetchRc = _sql.SQLFetch(hStmt);
+        if (fetchRc == SQL_NO_DATA) break;
+        if (!(fetchRc == SQL_SUCCESS || fetchRc == SQL_SUCCESS_WITH_INFO)) {
+          tryOdbc(fetchRc, handle: hStmt, onException: FetchException());
+        }
+
+        final row = <String, dynamic>{};
+
+        for (var colIndex = 1; colIndex <= columnCount; colIndex++) {
+          final colName = columnNames[colIndex - 1];
+          final colType = columnConfig[colName];
+
+          final valueLenPtr = calloc<SQLLEN>();
+          // default chunk bytes (512 wide chars -> 1024 bytes)
+          final bool isBinary = colType != null && colType.isBinary();
+          final int chunkBytes = isBinary ? (colType?.size ?? 1024) : (512 * sizeOf<Uint16>());
+
+          Pointer chunkBuf;
+          int bufElements;
+          if (isBinary) {
+            bufElements = chunkBytes; // bytes
+            chunkBuf = calloc<Uint8>(bufElements);
+          } else {
+            bufElements = chunkBytes ~/ sizeOf<Uint16>();
+            chunkBuf = calloc<Uint16>(bufElements);
+          }
+
+          final List<int> accumulator = <int>[];
+          int rc = SQL_SUCCESS;
+          bool sawNull = false;
+
+          try {
+            do {
+              rc = _sql.SQLGetData(
+                hStmt,
+                colIndex,
+                isBinary ? SQL_C_BINARY : SQL_C_WCHAR,
+                chunkBuf.cast(),
+                chunkBytes,
+                valueLenPtr,
+              );
+
+              final int lenOrInd = valueLenPtr.value;
+
+              if (lenOrInd == SQL_NULL_DATA) {
+                sawNull = true;
+                break;
+              }
+
+              if (lenOrInd == SQL_NO_TOTAL) {
+                // driver didn't tell total: use actual bytes read in chunk
+                if (isBinary) {
+                  final part = chunkBuf.cast<Uint8>().asTypedList(bufElements);
+                  accumulator.addAll(part);
+                } else {
+                  // exclude trailing NUL if present
+                  final part = chunkBuf.cast<Uint16>().asTypedList(bufElements);
+                  final used = part.takeWhile((v) => v != 0).toList();
+                  accumulator.addAll(used);
+                }
+              } else if (lenOrInd > 0) {
+                if (isBinary) {
+                  final take = lenOrInd < bufElements ? lenOrInd : bufElements;
+                  if (take > 0) {
+                    final part = chunkBuf.cast<Uint8>().asTypedList(bufElements).sublist(0, take);
+                    accumulator.addAll(part);
+                  }
+                } else {
+                  final reportedChars = (lenOrInd / sizeOf<Uint16>()).toInt();
+                  final maxChars = bufElements > 0 ? bufElements - 1 : 0;
+                  final take = reportedChars < maxChars ? reportedChars : maxChars;
+                  if (take > 0) {
+                    final part = chunkBuf.cast<Uint16>().asTypedList(bufElements).sublist(0, take);
+                    accumulator.addAll(part);
+                  }
+                }
+              }
+            } while (rc == SQL_SUCCESS_WITH_INFO);
+
+            if (!(rc == SQL_SUCCESS || rc == SQL_NO_DATA || rc == SQL_SUCCESS_WITH_INFO)) {
+              tryOdbc(rc, handle: hStmt, onException: FetchException());
+            }
+
+            if (sawNull) {
+              row[colName] = null;
+            } else if (isBinary) {
+              row[colName] = Uint8List.fromList(accumulator);
+            } else {
+              row[colName] = String.fromCharCodes(accumulator);
+            }
+          } finally {
+            calloc.free(chunkBuf);
+            calloc.free(valueLenPtr);
+          }
+        } // per-column
+        rows.add(row);
+      } // fetch loop
+
+      return rows;
+    } finally {
+      calloc.free(columnCountPtr);
     }
-
-    // free memory
-    _sql.SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-    calloc.free(columnCount);
-
-    return rows;
-  }
-
-  /// On some platforms with some drivers, the ODBC driver may return
-  /// whitespace characters as unicode characters. This function will remove
-  /// these unicode whitespace characters from the result set.
-  @Deprecated('This method is no longer needed')
-  static List<Map<String, dynamic>> removeWhitespaceUnicodes(
-    List<Map<String, dynamic>> result,
-  ) {
-    return result.map((record) {
-      final sanitizedDict = <String, String>{};
-      record.forEach((key, value) {
-        // Trim all whitespace from keys and values using a regular expression
-        final sanitizedKey = key.replaceAll(RegExp(r'\s+'), '');
-        final cleanedKey = sanitizedKey.removeUnicodeWhitespaces();
-        final sanitizedValue =
-            value.toString().replaceAll(RegExp(r'[\s\u00A0]+'), '');
-        final cleanedValue = sanitizedValue.removeUnicodeWhitespaces();
-
-        sanitizedDict[cleanedKey] = cleanedValue;
-      });
-      return sanitizedDict;
-    }).toList();
   }
 }
